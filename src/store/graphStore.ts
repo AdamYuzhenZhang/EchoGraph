@@ -8,6 +8,12 @@ import type {
 } from "@xyflow/react";
 import { create } from "zustand";
 import {
+  clearOpenAiApiKey,
+  generateAgentSuggestion,
+  hasOpenAiApiKey,
+  saveOpenAiApiKey
+} from "../lib/openAiRepository";
+import {
   listStoredSessions,
   loadSessionFromRepository,
   openSessionsDirectoryInFinder,
@@ -40,8 +46,11 @@ type GraphState = {
   pendingCenterNodeId: string | null;
   pendingFocusNodeId: string | null;
   storedSessions: StoredSessionSummary[];
+  hasOpenAiKey: boolean;
   isDirty: boolean;
   isStorageBusy: boolean;
+  isApiKeyBusy: boolean;
+  isAgentBusy: boolean;
   statusMessage: string | null;
   setViewMode: (mode: SessionViewMode) => void;
   setSelectedNodeId: (nodeId: string | null) => void;
@@ -52,6 +61,9 @@ type GraphState = {
   updateSessionTitle: (title: string) => void;
   updateNodeContent: (nodeId: string, content: string) => void;
   createNewSession: () => void;
+  loadOpenAiKeyStatus: () => Promise<void>;
+  saveOpenAiKey: (apiKey: string) => Promise<void>;
+  clearOpenAiKey: () => Promise<void>;
   loadStoredSessions: () => Promise<void>;
   saveSession: () => Promise<void>;
   saveSessionAsNew: () => Promise<void>;
@@ -66,8 +78,8 @@ type GraphState = {
   createSiblingNode: (referenceNodeId: string) => void;
   indentNode: (nodeId: string, newParentId: string) => void;
   outdentNode: (nodeId: string) => void;
-  spawnGhostNearSelected: () => void;
-  attachCriticToSelected: () => void;
+  spawnGhostNearSelected: () => Promise<void>;
+  attachCriticToSelected: () => Promise<void>;
   promoteGhostNode: (nodeId: string) => void;
   dismissNode: (nodeId: string) => void;
 };
@@ -82,6 +94,11 @@ function nextId(prefix: string) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function normalizeGeneratedText(value: string, fallback: string) {
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  return collapsed || fallback;
 }
 
 function edgeStyleFor(relation: SessionEdgeRelation) {
@@ -332,8 +349,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   pendingCenterNodeId: null,
   pendingFocusNodeId: null,
   storedSessions: [],
+  hasOpenAiKey: false,
   isDirty: true,
   isStorageBusy: false,
+  isApiKeyBusy: false,
+  isAgentBusy: false,
   statusMessage: null,
   setViewMode: (mode) =>
     set({
@@ -395,6 +415,76 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       isDirty: true,
       statusMessage: "Started a new session."
     });
+  },
+  loadOpenAiKeyStatus: async () => {
+    try {
+      const hasKey = await hasOpenAiApiKey();
+
+      set({
+        hasOpenAiKey: hasKey
+      });
+    } catch (error) {
+      set({
+        hasOpenAiKey: false,
+        statusMessage:
+          error instanceof Error
+            ? error.message
+            : "Failed to read secure OpenAI API key status."
+      });
+    }
+  },
+  saveOpenAiKey: async (apiKey) => {
+    const nextKey = apiKey.trim();
+
+    if (!nextKey) {
+      set({
+        statusMessage: "OpenAI API key cannot be empty."
+      });
+      return;
+    }
+
+    set({
+      isApiKeyBusy: true,
+      statusMessage: null
+    });
+
+    try {
+      await saveOpenAiApiKey(nextKey);
+
+      set({
+        hasOpenAiKey: true,
+        isApiKeyBusy: false,
+        statusMessage: "OpenAI API key saved in your OS keychain."
+      });
+    } catch (error) {
+      set({
+        isApiKeyBusy: false,
+        statusMessage:
+          error instanceof Error ? error.message : "Failed to save OpenAI API key."
+      });
+    }
+  },
+  clearOpenAiKey: async () => {
+    set({
+      isApiKeyBusy: true,
+      statusMessage: null
+    });
+
+    try {
+      await clearOpenAiApiKey();
+
+      set({
+        hasOpenAiKey: false,
+        isApiKeyBusy: false,
+        statusMessage: "OpenAI API key removed from your OS keychain."
+      });
+    } catch (error) {
+      set({
+        isApiKeyBusy: false,
+        statusMessage:
+          error instanceof Error ? error.message : "Failed to clear OpenAI API key."
+      });
+    }
   },
   loadStoredSessions: async () => {
     set({
@@ -871,85 +961,185 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       isDirty: true
     });
   },
-  spawnGhostNearSelected: () => {
+  spawnGhostNearSelected: async () => {
+    const selectedNodeId = get().selectedNodeId;
     const selectedNode = get().session.nodes.find(
-      (node) => node.id === get().selectedNodeId
+      (node) => node.id === selectedNodeId
     );
 
-    if (!selectedNode) {
+    if (!selectedNode || !selectedNodeId) {
       return;
     }
 
-    const nextNode: SessionNode = {
-      id: nextId("node"),
-      kind: "ghost",
-      content: `Adjacent angle for ${selectedNode.content}`,
-      note: "Prototype of a nearby branch that the Expander might surface.",
-      position: {
-        x: selectedNode.position.x + 260,
-        y: selectedNode.position.y - 70
-      }
-    };
+    if (!get().hasOpenAiKey) {
+      set({
+        statusMessage: "Add your OpenAI API key to use Expander suggestions."
+      });
+      return;
+    }
 
-    set((state) => ({
-      session: withUpdatedTimestamp(
-        normalizeSession({
-          ...state.session,
-          nodes: [...state.session.nodes, nextNode],
-          edges: [
-            ...state.session.edges,
-            {
-              id: nextId("edge"),
-              source: selectedNode.id,
-              target: nextNode.id,
-              relation: "suggestion"
-            }
-          ]
-        })
-      ),
-      selectedNodeId: nextNode.id,
-      isDirty: true
-    }));
+    set({
+      isAgentBusy: true,
+      statusMessage: "Expander is generating an adjacent idea..."
+    });
+
+    try {
+      const suggestion = await generateAgentSuggestion(
+        "expander",
+        get().session,
+        selectedNodeId
+      );
+
+      set((state) => {
+        const anchorNode = state.session.nodes.find(
+          (node) => node.id === selectedNodeId
+        );
+
+        if (!anchorNode) {
+          return {
+            isAgentBusy: false,
+            statusMessage: "The selected node was removed before the suggestion arrived."
+          };
+        }
+
+        const nextNode: SessionNode = {
+          id: nextId("node"),
+          kind: "ghost",
+          content: normalizeGeneratedText(
+            suggestion.content,
+            `Adjacent angle for ${anchorNode.content || "this idea"}`
+          ),
+          note: normalizeGeneratedText(
+            suggestion.note,
+            "Suggestion generated by the Expander."
+          ),
+          position: {
+            x: anchorNode.position.x + 260,
+            y: anchorNode.position.y - 70
+          }
+        };
+
+        return {
+          session: withUpdatedTimestamp(
+            normalizeSession({
+              ...state.session,
+              nodes: [...state.session.nodes, nextNode],
+              edges: [
+                ...state.session.edges,
+                {
+                  id: nextId("edge"),
+                  source: selectedNodeId,
+                  target: nextNode.id,
+                  relation: "suggestion"
+                }
+              ]
+            })
+          ),
+          selectedNodeId: nextNode.id,
+          isDirty: true,
+          isAgentBusy: false,
+          statusMessage: "Expander suggestion added."
+        };
+      });
+    } catch (error) {
+      set({
+        isAgentBusy: false,
+        statusMessage:
+          error instanceof Error
+            ? error.message
+            : "Expander request failed. Check your API key and network."
+      });
+    }
   },
-  attachCriticToSelected: () => {
+  attachCriticToSelected: async () => {
+    const selectedNodeId = get().selectedNodeId;
     const selectedNode = get().session.nodes.find(
-      (node) => node.id === get().selectedNodeId
+      (node) => node.id === selectedNodeId
     );
 
-    if (!selectedNode) {
+    if (!selectedNode || !selectedNodeId) {
       return;
     }
 
-    const nextNode: SessionNode = {
-      id: nextId("node"),
-      kind: "critic",
-      content: `Yes, but what blocks ${selectedNode.content.toLowerCase()}?`,
-      note: "Prototype of a pressure-test constraint introduced by the Critic.",
-      position: {
-        x: selectedNode.position.x + 260,
-        y: selectedNode.position.y + 120
-      }
-    };
+    if (!get().hasOpenAiKey) {
+      set({
+        statusMessage: "Add your OpenAI API key to use Critic suggestions."
+      });
+      return;
+    }
 
-    set((state) => ({
-      session: withUpdatedTimestamp(
-        normalizeSession({
-          ...state.session,
-          nodes: [...state.session.nodes, nextNode],
-          edges: [
-            ...state.session.edges,
-            {
-              id: nextId("edge"),
-              source: selectedNode.id,
-              target: nextNode.id,
-              relation: "constraint"
-            }
-          ]
-        })
-      ),
-      selectedNodeId: nextNode.id,
-      isDirty: true
-    }));
+    set({
+      isAgentBusy: true,
+      statusMessage: "Critic is drafting a challenge..."
+    });
+
+    try {
+      const suggestion = await generateAgentSuggestion(
+        "critic",
+        get().session,
+        selectedNodeId
+      );
+
+      set((state) => {
+        const anchorNode = state.session.nodes.find(
+          (node) => node.id === selectedNodeId
+        );
+
+        if (!anchorNode) {
+          return {
+            isAgentBusy: false,
+            statusMessage: "The selected node was removed before the critique arrived."
+          };
+        }
+
+        const nextNode: SessionNode = {
+          id: nextId("node"),
+          kind: "critic",
+          content: normalizeGeneratedText(
+            suggestion.content,
+            `Yes, but what blocks ${anchorNode.content.toLowerCase() || "this"}?`
+          ),
+          note: normalizeGeneratedText(
+            suggestion.note,
+            "Constraint generated by the Critic."
+          ),
+          position: {
+            x: anchorNode.position.x + 260,
+            y: anchorNode.position.y + 120
+          }
+        };
+
+        return {
+          session: withUpdatedTimestamp(
+            normalizeSession({
+              ...state.session,
+              nodes: [...state.session.nodes, nextNode],
+              edges: [
+                ...state.session.edges,
+                {
+                  id: nextId("edge"),
+                  source: selectedNodeId,
+                  target: nextNode.id,
+                  relation: "constraint"
+                }
+              ]
+            })
+          ),
+          selectedNodeId: nextNode.id,
+          isDirty: true,
+          isAgentBusy: false,
+          statusMessage: "Critic constraint added."
+        };
+      });
+    } catch (error) {
+      set({
+        isAgentBusy: false,
+        statusMessage:
+          error instanceof Error
+            ? error.message
+            : "Critic request failed. Check your API key and network."
+      });
+    }
   },
   promoteGhostNode: (nodeId) =>
     set((state) => ({

@@ -82,6 +82,11 @@ button:disabled {
   padding-top: 6px;
 }
 
+.topbar-row-key {
+  border-top: 1px dashed #e5e7eb;
+  padding-top: 6px;
+}
+
 .app-title {
   margin: 0;
   font-size: 1.05rem;
@@ -102,6 +107,37 @@ button:disabled {
 
 .stored-select {
   min-width: 220px;
+}
+
+.api-key-input {
+  flex: 1;
+  min-width: 320px;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #ffffff;
+}
+
+.api-key-status {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid #d1d5db;
+}
+
+.api-key-status-ready {
+  color: #065f46;
+  border-color: #6ee7b7;
+  background: #ecfdf5;
+}
+
+.api-key-status-missing {
+  color: #92400e;
+  border-color: #fcd34d;
+  background: #fffbeb;
 }
 
 .selected-node-text {
@@ -474,7 +510,8 @@ button:disabled {
   }
 
   .session-input,
-  .stored-select {
+  .stored-select,
+  .api-key-input {
     flex: 1 1 100%;
   }
 

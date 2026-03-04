@@ -1,9 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+const KEYRING_SERVICE: &str = "com.echograph.app";
+const KEYRING_ACCOUNT: &str = "openai_api_key";
+const OPENAI_CHAT_COMPLETIONS_URL: &str = "https://api.openai.com/v1/chat/completions";
+const OPENAI_DEFAULT_MODEL: &str = "gpt-4o-mini";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +66,38 @@ struct StoredSessionSummary {
     updated_at: String,
     session_id: String,
     saved_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSuggestion {
+    content: String,
+    note: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatCompletionResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    content: Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorEnvelope {
+    error: OpenAiErrorBody,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiErrorBody {
+    message: String,
 }
 
 fn sessions_directory() -> Result<PathBuf, String> {
@@ -226,6 +264,256 @@ fn open_path(path: &Path, reveal: bool) -> Result<(), String> {
     }
 }
 
+fn keyring_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+        .map_err(|error| format!("Failed to initialize keychain entry: {error}"))
+}
+
+fn normalize_api_key(raw_key: &str) -> Result<String, String> {
+    let trimmed = raw_key.trim();
+
+    if trimmed.is_empty() {
+        return Err("OpenAI API key cannot be empty.".to_string());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn read_openai_api_key() -> Result<String, String> {
+    let entry = keyring_entry()?;
+
+    match entry.get_password() {
+        Ok(value) => normalize_api_key(&value),
+        Err(keyring::Error::NoEntry) => {
+            Err("OpenAI API key is not configured. Add your key in the app first.".to_string())
+        }
+        Err(error) => Err(format!(
+            "Failed to read OpenAI API key from your keychain: {error}"
+        )),
+    }
+}
+
+fn system_prompt_for_agent(agent_kind: &str) -> Result<&'static str, String> {
+    match agent_kind {
+        "expander" => Ok(
+            "You are the Expander agent for a brainstorming graph. Return concise, adjacent ideas that add new angles without repeating existing nodes. Respond with valid JSON matching the schema.",
+        ),
+        "critic" => Ok(
+            "You are the Critic agent for a brainstorming graph. Return a constructive challenge or risk that pressure-tests the selected idea. Respond with valid JSON matching the schema.",
+        ),
+        _ => Err("Unsupported agent kind. Use expander or critic.".to_string()),
+    }
+}
+
+fn build_agent_prompt(
+    agent_kind: &str,
+    session: &BrainstormSession,
+    selected_node_id: &str,
+) -> Result<String, String> {
+    let selected_node = session
+        .nodes
+        .iter()
+        .find(|node| node.id == selected_node_id)
+        .ok_or_else(|| "Selected node was not found in the current session.".to_string())?;
+
+    let parent_id = session
+        .edges
+        .iter()
+        .find(|edge| edge.target == selected_node_id)
+        .map(|edge| edge.source.clone());
+    let child_ids = session
+        .edges
+        .iter()
+        .filter(|edge| edge.source == selected_node_id)
+        .map(|edge| edge.target.clone())
+        .collect::<Vec<_>>();
+
+    let context = json!({
+        "agentKind": agent_kind,
+        "sessionId": session.id,
+        "sessionTitle": session.title,
+        "selectedNode": {
+            "id": selected_node.id,
+            "kind": selected_node.kind,
+            "content": selected_node.content,
+            "note": selected_node.note,
+            "parentId": parent_id,
+            "childIds": child_ids,
+        },
+        "graph": {
+            "nodes": session.nodes,
+            "edges": session.edges,
+        }
+    });
+
+    let context_text = serde_json::to_string_pretty(&context)
+        .map_err(|error| format!("Failed to serialize graph context: {error}"))?;
+
+    let instruction = if agent_kind == "expander" {
+        "Generate one adjacent branch idea that is concrete and distinct from existing branches."
+    } else {
+        "Generate one constructive challenge that identifies a blind spot, risk, or assumption to test."
+    };
+
+    Ok(format!(
+        "{}\n\nConstraints:\n- content: max 90 characters\n- note: max 180 characters\n- no markdown\n\nGraph context JSON:\n{}",
+        instruction, context_text
+    ))
+}
+
+fn extract_openai_content(content: &Value) -> Result<String, String> {
+    if let Some(text) = content.as_str() {
+        return Ok(text.to_string());
+    }
+
+    if let Some(parts) = content.as_array() {
+        let joined = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        if !joined.trim().is_empty() {
+            return Ok(joined);
+        }
+    }
+
+    Err("OpenAI returned an unsupported response content format.".to_string())
+}
+
+#[tauri::command]
+fn has_openai_api_key() -> Result<bool, String> {
+    let entry = keyring_entry()?;
+
+    match entry.get_password() {
+        Ok(value) => Ok(!value.trim().is_empty()),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(format!(
+            "Failed to check OpenAI API key status in keychain: {error}"
+        )),
+    }
+}
+
+#[tauri::command]
+fn set_openai_api_key(api_key: String) -> Result<(), String> {
+    let normalized_key = normalize_api_key(&api_key)?;
+    let entry = keyring_entry()?;
+
+    entry
+        .set_password(&normalized_key)
+        .map_err(|error| format!("Failed to save OpenAI API key in keychain: {error}"))
+}
+
+#[tauri::command]
+fn clear_openai_api_key() -> Result<(), String> {
+    let entry = keyring_entry()?;
+
+    match entry.delete_password() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!(
+            "Failed to remove OpenAI API key from keychain: {error}"
+        )),
+    }
+}
+
+#[tauri::command]
+async fn generate_agent_suggestion(
+    agent_kind: String,
+    session: BrainstormSession,
+    selected_node_id: String,
+) -> Result<AgentSuggestion, String> {
+    let api_key = read_openai_api_key()?;
+    let system_prompt = system_prompt_for_agent(&agent_kind)?;
+    let user_prompt = build_agent_prompt(&agent_kind, &session, &selected_node_id)?;
+
+    let request_body = json!({
+        "model": OPENAI_DEFAULT_MODEL,
+        "temperature": if agent_kind == "expander" { 0.9 } else { 0.45 },
+        "messages": [
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            }
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "echograph_agent_suggestion",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "content": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 90
+                        },
+                        "note": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 180
+                        }
+                    },
+                    "required": ["content", "note"]
+                }
+            }
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(OPENAI_CHAT_COMPLETIONS_URL)
+        .bearer_auth(api_key)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to contact OpenAI API: {error}"))?;
+
+    let status = response.status();
+    let body_text = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read OpenAI API response body: {error}"))?;
+
+    if !status.is_success() {
+        let openai_error = serde_json::from_str::<OpenAiErrorEnvelope>(&body_text)
+            .ok()
+            .map(|payload| payload.error.message)
+            .unwrap_or_else(|| body_text.clone());
+
+        return Err(format!(
+            "OpenAI API request failed ({}): {}",
+            status.as_u16(),
+            openai_error
+        ));
+    }
+
+    let payload = serde_json::from_str::<OpenAiChatCompletionResponse>(&body_text)
+        .map_err(|error| format!("Failed to parse OpenAI API response: {error}"))?;
+
+    let first_choice = payload
+        .choices
+        .first()
+        .ok_or_else(|| "OpenAI API returned no choices.".to_string())?;
+    let content_text = extract_openai_content(&first_choice.message.content)?;
+    let suggestion = serde_json::from_str::<AgentSuggestion>(&content_text)
+        .map_err(|error| format!("Failed to parse structured suggestion JSON: {error}"))?;
+
+    let content = suggestion.content.trim().to_string();
+    let note = suggestion.note.trim().to_string();
+
+    if content.is_empty() || note.is_empty() {
+        return Err("OpenAI returned empty suggestion fields.".to_string());
+    }
+
+    Ok(AgentSuggestion { content, note })
+}
+
 #[tauri::command]
 fn list_sessions() -> Result<Vec<StoredSessionSummary>, String> {
     let dir = ensure_sessions_directory()?;
@@ -312,6 +600,10 @@ fn reveal_session_in_finder(file_path: String) -> Result<(), String> {
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
+            has_openai_api_key,
+            set_openai_api_key,
+            clear_openai_api_key,
+            generate_agent_suggestion,
             list_sessions,
             save_session_to_file,
             load_session_from_file,

@@ -171,3 +171,15 @@ Each saved session uses a file format like:
 ```
 
 You can list/open saved sessions from the app, open the sessions folder, and reveal the current session file in Finder.
+
+## OpenAI BYOK Setup (Secure)
+
+EchoGraph now includes an in-app OpenAI key field:
+
+* Paste your key in the top bar and click **Save Key**.
+* The key is stored in your OS credential store (macOS Keychain / Windows Credential Manager / Linux Secret Service), not in session JSON files.
+* Expander and Critic actions call OpenAI through the Tauri backend, so the key is not embedded in source code or saved in project files.
+
+Git safety:
+
+* `.env` and `.env.*` are ignored in `.gitignore` to avoid accidentally committing local secrets.

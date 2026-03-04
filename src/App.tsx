@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import BrainstormCanvas from "./components/BrainstormCanvas";
 import SessionOutline from "./components/SessionOutline";
 import { sessionSummaryLabel, useGraphStore } from "./store/graphStore";
@@ -12,6 +12,9 @@ function App() {
   const storedSessions = useGraphStore((state) => state.storedSessions);
   const isDirty = useGraphStore((state) => state.isDirty);
   const isStorageBusy = useGraphStore((state) => state.isStorageBusy);
+  const hasOpenAiKey = useGraphStore((state) => state.hasOpenAiKey);
+  const isApiKeyBusy = useGraphStore((state) => state.isApiKeyBusy);
+  const isAgentBusy = useGraphStore((state) => state.isAgentBusy);
   const statusMessage = useGraphStore((state) => state.statusMessage);
   const setViewMode = useGraphStore((state) => state.setViewMode);
   const setSelectedStoredPath = useGraphStore(
@@ -20,6 +23,9 @@ function App() {
   const updateSessionTitle = useGraphStore((state) => state.updateSessionTitle);
   const addChildNode = useGraphStore((state) => state.addChildNode);
   const createNewSession = useGraphStore((state) => state.createNewSession);
+  const loadOpenAiKeyStatus = useGraphStore((state) => state.loadOpenAiKeyStatus);
+  const saveOpenAiKey = useGraphStore((state) => state.saveOpenAiKey);
+  const clearOpenAiKey = useGraphStore((state) => state.clearOpenAiKey);
   const loadStoredSessions = useGraphStore((state) => state.loadStoredSessions);
   const saveSession = useGraphStore((state) => state.saveSession);
   const saveSessionAsNew = useGraphStore((state) => state.saveSessionAsNew);
@@ -40,12 +46,17 @@ function App() {
   );
   const promoteGhostNode = useGraphStore((state) => state.promoteGhostNode);
   const dismissNode = useGraphStore((state) => state.dismissNode);
+  const [apiKeyDraft, setApiKeyDraft] = useState("");
   const selectedNode =
     session.nodes.find((node) => node.id === selectedNodeId) ?? null;
 
   useEffect(() => {
     void loadStoredSessions();
   }, [loadStoredSessions]);
+
+  useEffect(() => {
+    void loadOpenAiKeyStatus();
+  }, [loadOpenAiKeyStatus]);
 
   return (
     <div className="app-shell">
@@ -150,6 +161,51 @@ function App() {
           </div>
         </div>
 
+        <div className="topbar-row topbar-row-key">
+          <span
+            className={`api-key-status ${
+              hasOpenAiKey ? "api-key-status-ready" : "api-key-status-missing"
+            }`}
+          >
+            {hasOpenAiKey ? "OpenAI key configured" : "OpenAI key missing"}
+          </span>
+          <input
+            className="api-key-input"
+            type="password"
+            value={apiKeyDraft}
+            onChange={(event) => {
+              setApiKeyDraft(event.target.value);
+            }}
+            placeholder={
+              hasOpenAiKey
+                ? "Enter new OpenAI API key to replace current key"
+                : "Paste your OpenAI API key (stored securely on this device)"
+            }
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button
+            type="button"
+            onClick={() => {
+              void saveOpenAiKey(apiKeyDraft);
+            }}
+            disabled={isApiKeyBusy || !apiKeyDraft.trim()}
+          >
+            Save Key
+          </button>
+          <button
+            type="button"
+            className="ghost"
+            onClick={() => {
+              void clearOpenAiKey();
+              setApiKeyDraft("");
+            }}
+            disabled={isApiKeyBusy || !hasOpenAiKey}
+          >
+            Clear Key
+          </button>
+        </div>
+
         <div className="topbar-row topbar-row-secondary">
           {selectedNode ? (
             <>
@@ -167,10 +223,22 @@ function App() {
               >
                 + Child
               </button>
-              <button type="button" onClick={spawnGhostNearSelected}>
-                Expander
+              <button
+                type="button"
+                onClick={() => {
+                  void spawnGhostNearSelected();
+                }}
+                disabled={!hasOpenAiKey || isAgentBusy}
+              >
+                {isAgentBusy ? "Thinking..." : "Expander"}
               </button>
-              <button type="button" onClick={attachCriticToSelected}>
+              <button
+                type="button"
+                onClick={() => {
+                  void attachCriticToSelected();
+                }}
+                disabled={!hasOpenAiKey || isAgentBusy}
+              >
                 Critic
               </button>
               <button
